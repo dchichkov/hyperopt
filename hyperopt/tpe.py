@@ -8,6 +8,7 @@ __contact__ = "github.com/jaberg/hyperopt"
 
 import copy
 import logging
+import sys
 import time
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,8 @@ def lognormal_cdf(x, mu, sigma):
     # the maximum is used to move negative values and 0 up to a point
     # where they do not cause nan or inf, but also don't contribute much
     # to the cdf.
+    if len(x) == 0:
+        return np.asarray([])
     if x.min() < 0:
         raise ValueError('negative arg to lognormal_cdf', x)
     olderr = np.seterr(divide='ignore')
@@ -556,15 +559,15 @@ class TreeParzenEstimator(BanditAlgo):
     # -- the prior takes a weight in the Parzen mixture
     #    that is the sqrt of the number of observations
     #    times this number.
-    prior_weight = 1.0
+    prior_weight = 0.3
 
     # -- suggest best of this many draws on every iteration
     n_EI_candidates = 1
 
     # -- fraction of trials to consider as good
-    gamma = 0.20
+    gamma = 0.15
 
-    n_startup_jobs = 10
+    n_startup_jobs = 5
 
     # -- TODO: ignore distant past, because presumably all of the other
     #          dimensions have moved on since then, so old scores should be
@@ -738,8 +741,8 @@ class TreeParzenEstimator(BanditAlgo):
         assert len(all_vals) == len(lbounds)
         # XXX should this be <= ?
         if any(pti < lbi for pti, lbi in zip(all_vals, lbounds) if lbi is not None):
-            print all_vals
-            print lbounds
+            for pti, lbi in zip(all_vals, lbounds):
+                print pti,'<',  lbi, ':', pti < lbi
             raise ValueError('sampler did not respect lbound', (pti, lbi))
         assert len(all_vals) == len(ubounds)
         # XXX should this be >= ?
@@ -768,6 +771,7 @@ class TreeParzenEstimator(BanditAlgo):
             #for k, v in self.post_below['vals'].items():
             for nid in nids_to_optimize:
                 nv = len(i_idxs_vals[1][nid])
+                assert nv == 1
                 new_vals = np.array(pt[ii:ii+nv])
 
                 v = self.post_below['vals'][nid]
@@ -791,10 +795,14 @@ class TreeParzenEstimator(BanditAlgo):
 
         assert len(found) == len(lbounds) == len(qlevels)
         if any(pti < lbi for pti, lbi in zip(found, lbounds) if lbi is not None):
-            print >> sys.sterr, "Optimizer ignored the lower bounds", pti, lbi
+            for pti, lbi in zip(all_vals, lbounds):
+                print pti,'<',  lbi, ':', pti < lbi
+            print >> sys.stderr, "Optimizer ignored the lower bounds"
             return memo
         if any(pti > ubi for pti, ubi in zip(found, ubounds) if ubi is not None):
-            print >> sys.sterr, "Optimizer ignored the upper bounds", pti, ubi
+            for pti, ubi in zip(all_vals, ubounds):
+                print pti,'>',  ubi, ':', pti > ubi
+            print >> sys.stderr, "Optimizer ignored the upper bounds"
             return memo
 
         found = [pti if qi is None else np.ceil(pti / qi) * qi
@@ -844,6 +852,7 @@ class TreeParzenEstimator(BanditAlgo):
             loss = bandit.loss(doc['result'], doc['spec'])
             best_docs_loss.setdefault(tid, loss)
             if loss <= best_docs_loss[tid]:
+                best_docs_loss[tid] = loss
                 best_docs[tid] = doc
         docs = best_docs.items()
         docs.sort()

@@ -1097,6 +1097,7 @@ def main_worker_helper(options, args):
                 exp_key=options.exp_key)
         mworker.run_one(reserve_timeout=float(options.reserve_timeout))
     else:
+        # XXX: parser is not defined anymore
         parser.print_help()
         return -1
 
