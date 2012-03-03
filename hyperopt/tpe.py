@@ -69,6 +69,8 @@ def GMM1(weights, mus, sigmas, low=None, high=None, q=None, rng=None,
         # -- draw from a standard GMM
         active = np.argmax(rng.multinomial(1, weights, (n_samples,)), axis=1)
         samples = rng.normal(loc=mus[active], scale=sigmas[active])
+        if q is not None:
+            samples = np.maximum(np.ceil(samples / q) * q, q)
     else:
         # -- draw from truncated components
         # TODO: one-sided-truncation
@@ -80,14 +82,13 @@ def GMM1(weights, mus, sigmas, low=None, high=None, q=None, rng=None,
         while len(samples) < n_samples:
             active = np.argmax(rng.multinomial(1, weights))
             draw = rng.normal(loc=mus[active], scale=sigmas[active])
+            if q is not None:
+                draw = np.ceil(draw / q) * q
             if low <= draw < high:
                 samples.append(draw)
     samples = np.reshape(np.asarray(samples), size)
     #print 'SAMPLES', samples
-    if q is None:
-        return samples
-    else:
-        return np.ceil(samples / q) * q
+    return samples
 
 @scope.define
 def normal_cdf(x, mu, sigma):
@@ -125,7 +126,7 @@ def GMM1_lpdf(samples, weights, mus, sigmas, low=None, high=None, q=None):
         for w, mu, sigma in zip(weights, mus, sigmas):
             prob += w * normal_cdf(samples, mu, sigma)
             prob -= w * normal_cdf(samples - q, mu, sigma)
-        rval = np.log(prob) - np.log(p_accept)
+        rval = np.log(np.maximum(prob, EPS)) - np.log(p_accept)
 
     rval.shape = _samples.shape
     return rval
@@ -189,6 +190,8 @@ def LGMM1(weights, mus, sigmas, low=None, high=None, q=None, rng=None, size=()):
                 rng.normal(
                     loc=mus[active],
                     scale=sigmas[active]))
+        if q is not None:
+            samples = np.maximum(np.ceil(samples / q) * q, q)
     else:
         # -- draw from truncated components
         # TODO: one-sided-truncation
@@ -197,16 +200,19 @@ def LGMM1(weights, mus, sigmas, low=None, high=None, q=None, rng=None, size=()):
         if low >= high:
             raise ValueError('low >= high', (low, high))
         samples = []
+        exp_low = np.exp(low)
+        exp_high = np.exp(high)
         while len(samples) < n_samples:
             active = np.argmax(rng.multinomial(1, weights))
             draw = rng.normal(loc=mus[active], scale=sigmas[active])
-            if low <= draw < high:
-                samples.append(np.exp(draw))
+            draw = np.exp(draw)
+            if q is not None:
+                draw = np.maximum(np.ceil(draw / q) * q, q)
+            if exp_low <= draw < exp_high:
+                samples.append(draw)
         samples = np.asarray(samples)
 
     samples = np.reshape(np.asarray(samples), size)
-    if q is not None:
-        samples = np.maximum(np.ceil(samples / q) * q, q)
     return samples
 
 
@@ -553,7 +559,7 @@ class TreeParzenEstimator(BanditAlgo):
     prior_weight = 1.0
 
     # -- suggest best of this many draws on every iteration
-    n_EI_candidates = 256 * 4
+    n_EI_candidates = 1
 
     # -- fraction of trials to consider as good
     gamma = 0.20
@@ -657,6 +663,157 @@ class TreeParzenEstimator(BanditAlgo):
         rval = scope.idxs_prod(self.s_new_ids, obs['idxs'], llik)
         return rval
 
+    def refine_no_grad(self, memo, BIG=1e15, MEDIUM=1e4):
+        if self.n_EI_candidates > 1:
+            # TODO
+            # it would be neat to draw a bunch of candidates and then optimize
+            # the best one
+            raise NotImplementedError()
+
+        # draw a sample from the posterior below gamma to start things off
+        i_idxs_vals = pyll.rec_eval(
+                (self.post_below['idxs'], self.post_below['vals']),
+                memo=memo)
+
+        # -- figure out which variables we're going to optimize, and
+        #    how they should be bounded.
+        nids_to_optimize = []
+        all_vals = []
+        lbounds = []
+        ubounds = []
+        qlevels = []
+        for nid in i_idxs_vals[0]:
+            if len(i_idxs_vals[1][nid]) == 0:
+                continue
+            assert len(i_idxs_vals[1][nid]) == 1
+            dist = self.name_by_nid[nid]
+            sval = self.vals_by_nid[nid]
+            if dist in ('uniform', 'quniform', 'loguniform', 'qloguniform'):
+                nids_to_optimize.append(nid)
+                all_vals.extend(i_idxs_vals[1][nid])
+                lbound = sval.pos_args[0].obj
+                ubound = sval.pos_args[1].obj
+                # XXX: use pyll lookup by param name
+                if 'log' in dist:
+                    lbounds.append(np.exp(lbound))
+                    ubounds.append(np.exp(ubound))
+                else:
+                    lbounds.append(lbound)
+                    ubounds.append(ubound)
+                if 'q' in dist:
+                    # XXX: use pyll lookup by param name
+                    try:
+                        q = sval.pos_args[2].obj
+                    except IndexError:
+                        q = [a.obj for n, a in sval.named_args if n == 'q'][0]
+                    qlevels.append(q)
+                else:
+                    qlevels.append(None)
+            elif dist in ('normal', 'qnormal', 'lognormal', 'qlognormal'):
+                nids_to_optimize.append(nid)
+                all_vals.extend(i_idxs_vals[1][nid])
+                # XXX: use pyll lookup by param name
+                if 'log' in dist:
+                    lbounds.append(1e-12)
+                    ubounds.append(MEDIUM)
+                else:
+                    lbounds.append(-MEDIUM)
+                    ubounds.append(MEDIUM)
+                if 'q' in dist:
+                    # XXX: use pyll lookup by param name
+                    try:
+                        q = sval.pos_args[2].obj
+                    except IndexError:
+                        q = [a.obj for n, a in sval.named_args if n == 'q'][0]
+                    qlevels.append(q)
+                else:
+                    qlevels.append(None)
+            elif 'randint' == dist:
+                pass
+            else:
+                print 'FOUND NODE', sval
+                raise NotImplementedError(dist)
+
+        assert len(all_vals) == len(nids_to_optimize)
+        assert len(all_vals) == len(lbounds)
+        # XXX should this be <= ?
+        if any(pti < lbi for pti, lbi in zip(all_vals, lbounds) if lbi is not None):
+            print all_vals
+            print lbounds
+            raise ValueError('sampler did not respect lbound', (pti, lbi))
+        assert len(all_vals) == len(ubounds)
+        # XXX should this be >= ?
+        if any(pti > ubi for pti, ubi in zip(all_vals, ubounds) if ubi is not None):
+            for pti, ubi in zip(all_vals, ubounds):
+                print pti,'>',  ubi, ':', pti > ubi
+            raise ValueError('sampler did not respect ubound', (pti, lbi))
+
+        def neg_EI(pt):
+            t0 = time.time()
+            assert len(pt) == len(lbounds)
+            if any(pti < lbi for pti, lbi in zip(pt, lbounds) if lbi is not None):
+                return BIG
+            if any(pti > ubi for pti, ubi in zip(pt, ubounds) if ubi is not None):
+                return BIG
+
+            pt = [pti if qi is None else np.ceil(1e-8 + pti / qi) * qi
+                    for (pti, qi) in zip(pt, qlevels)]
+
+            opt_memo = {}
+            for k in memo:
+                # SHALLOW COPY FOR SPEED
+                opt_memo[k] = memo[k]
+            #print pt
+            ii = 0
+            #for k, v in self.post_below['vals'].items():
+            for nid in nids_to_optimize:
+                nv = len(i_idxs_vals[1][nid])
+                new_vals = np.array(pt[ii:ii+nv])
+
+                v = self.post_below['vals'][nid]
+                assert v in opt_memo
+                opt_memo[v] = new_vals
+                
+                ii += nv
+
+            aa, bb = pyll.rec_eval(
+                [self.post_above['llik'], self.post_below['llik']],
+                memo=opt_memo)
+            # -- we're minimizing -EI here
+            rval = -(bb - aa)
+            #print 'neg_EI_rval', rval
+            #print time.time() - t0
+            return rval
+        found = scipy.optimize.fmin_powell(neg_EI, all_vals, maxfun=500)
+
+        # -- turn into vector if scalar
+        found = np.asarray(found).flatten()
+
+        assert len(found) == len(lbounds) == len(qlevels)
+        if any(pti < lbi for pti, lbi in zip(found, lbounds) if lbi is not None):
+            print >> sys.sterr, "Optimizer ignored the lower bounds", pti, lbi
+            return memo
+        if any(pti > ubi for pti, ubi in zip(found, ubounds) if ubi is not None):
+            print >> sys.sterr, "Optimizer ignored the upper bounds", pti, ubi
+            return memo
+
+        found = [pti if qi is None else np.ceil(pti / qi) * qi
+                for (pti, qi) in zip(found, qlevels)]
+
+        # copy the result of the optimization back into the memo used
+        # to construct specs
+        ii = 0
+        for nid in nids_to_optimize:
+            v = self.post_below['vals'][nid]
+            assert v in memo # -- because of drawing i_idxs_vals
+            nv = len(i_idxs_vals[1][nid])
+            new_vals = np.array(found[ii:ii+nv])
+            memo[v] = new_vals
+            ii += nv
+        assert ii == len(all_vals)
+        return memo
+
+
     def suggest(self, new_ids, trials):
         if len(new_ids) > 1:
             # write a loop to draw new points sequentially
@@ -728,82 +885,7 @@ class TreeParzenEstimator(BanditAlgo):
         memo[self.observed_loss['vals']] = \
                 [bandit.loss(d['result'], d['spec']) for d in docs]
 
-
-        if 1:
-            if self.n_EI_candidates > 1:
-                raise NotImplementedError()
-
-            # draw a sample from the posterior below gamma to start things off
-            i_idxs_vals = pyll.rec_eval(
-                    (self.post_below['idxs'], self.post_below['vals']),
-                    memo=memo)
-
-            if 0:
-
-
-                # -- figure out which variables we're going to optimize, and
-                #    how they should be bounded.
-                nids_to_optimize = []
-                lbounds = []
-                ubounds = []
-                for k in i_idxs_vals[0]:
-                    dist = self.vh.name_by_id[k]
-                    if 'uniform' == dist:
-                        nids_to_optimize.append(k)
-                        lbounds.append(np.exp())
-                        ubounds.append(np.exp())
-                    if 'loguniform' == dist:
-                        nids_to_optimize.append(k)
-                        lbounds.append(np.exp())
-                        ubounds.append(np.exp())
-                    if 'normal' in dist:
-                        nids_to_optimize.append(k)
-                        lbounds.append(None)
-                        ubounds.append(None)
-
-            # -- flatten the sampled vals
-            all_vals = []
-            for k, v in i_idxs_vals[1].items():
-                all_vals.extend(v)
-
-            def foo(pt):
-                t0 = time.time()
-                if np.min(pt) <= 0 or np.max(pt) > 1:
-                    return float('inf')
-
-                opt_memo = {}
-                for k in memo:
-                    # CONSIDER SHALLOW COPY FOR SPEED
-                    #opt_memo[k] = copy.deepcopy(memo[k])
-                    opt_memo[k] = memo[k]
-                #print pt
-                ii = 0
-                for k, v in self.post_below['vals'].items():
-                    assert v in opt_memo
-                    nv = len(i_idxs_vals[1][k])
-                    new_vals = np.array(pt[ii:ii+nv])
-                    opt_memo[v] = new_vals
-                    ii += nv
-                aa, bb = pyll.rec_eval(
-                    [self.post_above['llik'], self.post_below['llik']],
-                    memo=opt_memo)
-                rval = -(bb - aa).max()
-                #print rval
-                #print time.time() - t0
-                return rval
-            found = scipy.optimize.fmin_powell(foo, all_vals, maxfun=1000)
-
-            print found
-
-            # copy the result of the optimization back into the memo used
-            # to construct specs
-            ii = 0
-            for k, v in self.post_below['vals'].items():
-                assert v in memo # -- because of drawing i_idxs_vals
-                nv = len(i_idxs_vals[1][k])
-                new_vals = np.array(found[ii:ii+nv])
-                memo[v] = new_vals
-                ii += nv
+        memo = self.refine_no_grad(memo)
 
         R = pyll.rec_eval(
                 dict(
