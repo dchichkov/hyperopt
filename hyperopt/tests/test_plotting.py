@@ -30,7 +30,7 @@ class TestPlotting(unittest.TestCase):
         trials = Trials()
         experiment = Experiment(trials, algo, async=False)
         experiment.max_queue_len = 1
-        N=200
+        N=20
         if 0:
             import cProfile
             stats = cProfile.runctx('experiment.run(N)', globals={},

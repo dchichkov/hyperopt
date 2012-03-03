@@ -6,11 +6,15 @@ __authors__ = "James Bergstra"
 __license__ = "3-clause BSD License"
 __contact__ = "github.com/jaberg/hyperopt"
 
+import copy
 import logging
+import time
 logger = logging.getLogger(__name__)
 
 import numpy as np
 from scipy.special import erf
+import scipy.optimize
+
 import pyll
 from pyll import scope
 from pyll.stochastic import implicit_stochastic
@@ -277,8 +281,8 @@ def adaptive_parzen_normal(mus, prior_weight, prior_mu, prior_sigma):
         mus = np.asarray([prior_mu])
         sigma = np.asarray([prior_sigma])
     elif len(mus) == 1:
-        mus = np.asarray([prior_mu] + [mus[0]])
-        sigma = np.asarray([prior_sigma, prior_sigma * .5])
+        mus = np.asarray([mus[0], prior_mu])
+        sigma = np.asarray([prior_sigma * .5, prior_sigma])
     elif len(mus) >= 2:
         order = np.argsort(mus)
         mus = mus[order]
@@ -296,8 +300,7 @@ def adaptive_parzen_normal(mus, prior_weight, prior_mu, prior_sigma):
         sigma[0] = lsigma
         sigma[-1] = usigma
 
-        # XXX: is sorting them necessary anymore?
-        # un-sort the mus and sigma
+        # un-sort the mus and sigma, put them back into the original order
         mus[order] = mus.copy()
         sigma[order] = sigma.copy()
 
@@ -306,9 +309,9 @@ def adaptive_parzen_normal(mus, prior_weight, prior_mu, prior_sigma):
             print 'mus', mus
         assert np.all(mus_orig == mus)
 
-        # put the prior back in
-        mus = np.asarray([prior_mu] + list(mus))
-        sigma = np.asarray([prior_sigma] + list(sigma))
+        # put the prior back in at the end of the list
+        mus = np.asarray(list(mus) + [prior_mu])
+        sigma = np.asarray(list(sigma) + [prior_sigma])
 
     maxsigma = prior_sigma
     # -- magic formula:
@@ -317,11 +320,14 @@ def adaptive_parzen_normal(mus, prior_weight, prior_mu, prior_sigma):
     #print 'maxsigma, minsigma', maxsigma, minsigma
     sigma = np.clip(sigma, minsigma, maxsigma)
 
-    weights = np.ones(len(mus), dtype=mus.dtype)
-    weights[0] = prior_weight #* np.sqrt(1 + len(mus))
+    weights = 1 + np.arange(len(mus), dtype=mus.dtype)
+    weights[-1] -= 1
+    weights[-1] *= prior_weight #* np.sqrt(1 + len(mus))
 
     #print weights.dtype
     weights = weights / weights.sum()
+    if len(weights) == 2:
+        print 'AP', weights, mus, sigma
     if 0:
         print 'WEIGHTS', weights
         print 'MUS', mus
@@ -443,8 +449,13 @@ def ap_filter_trials(o_idxs, o_vals, l_idxs, l_vals, gamma, above_or_below):
     else:
         raise ValueError(above_or_below)
 
-    rval = [v for i, v in zip(o_idxs, o_vals) if i in keep_idxs]
-
+    # return the o_vals that we're going to keep, in the order of their
+    # indexes in o_idxs
+    # This is going to be used in adaptive_parzen_normal to down-weight
+    # old points.
+    rval_iv = [(i, v) for i, v in zip(o_idxs, o_vals) if i in keep_idxs]
+    rval_iv.sort()
+    rval = [v for i, v in rval_iv]
     return np.asarray(rval)
 
 
@@ -539,7 +550,7 @@ class TreeParzenEstimator(BanditAlgo):
     # -- the prior takes a weight in the Parzen mixture
     #    that is the sqrt of the number of observations
     #    times this number.
-    prior_weight = 2.0
+    prior_weight = 1.0
 
     # -- suggest best of this many draws on every iteration
     n_EI_candidates = 256 * 4
@@ -549,18 +560,23 @@ class TreeParzenEstimator(BanditAlgo):
 
     n_startup_jobs = 10
 
-    linear_forgetting = True
+    # -- TODO: ignore distant past, because presumably all of the other
+    #          dimensions have moved on since then, so old scores should be
+    #          forgotten.
+    linear_forgetting = 0
 
     def __init__(self, bandit,
             gamma=gamma,
             prior_weight=prior_weight,
             n_EI_candidates=n_EI_candidates,
+            n_startup_jobs=n_startup_jobs,
             linear_forgetting=linear_forgetting,
             **kwargs):
         BanditAlgo.__init__(self, bandit, **kwargs)
         self.gamma = gamma
         self.prior_weight = prior_weight
         self.n_EI_candidates = n_EI_candidates
+        self.n_startup_jobs = n_startup_jobs
         self.linear_forgetting = linear_forgetting
 
         self.s_prior_weight = pyll.Literal(float(self.prior_weight))
@@ -607,6 +623,26 @@ class TreeParzenEstimator(BanditAlgo):
                 )
         return dict(specs=specs, idxs=idxs, vals=vals)
 
+    def forget_filter(self, docs):
+        if self.linear_forgetting and len(docs) > self.linear_forgetting:
+            losses = [self.bandit.loss(d['result'], d['spec']) for d in docs]
+            assert None not in losses # -- we already got rid of these
+            best_order = np.argsort(losses)
+            rval = [docs[ii] for ii in best_order[:self.linear_forgetting]]
+            return rval
+
+            LF = self.linear_forgetting
+            pkeepdoc = (1.0 - np.arange(len(docs), dtype='float') / len(docs))[::-1]
+            if 1:
+                pkeepdoc *= len(docs) / float(len(docs) - LF)
+                assert np.all(pkeepdoc[-LF:] >= 1.0)
+            keepdoc = self.rng.rand(len(docs)) < pkeepdoc
+            #print pkeepdoc
+            #print keepdoc
+            assert len(keepdoc) == len(docs)
+            docs = [d for k, d in zip(keepdoc, docs) if k]
+        return docs
+
     def llik(self, obs, density):
         """Add log-likelihood functions for the values"""
         llik = {}
@@ -633,6 +669,7 @@ class TreeParzenEstimator(BanditAlgo):
         assert len(new_ids) == 1
         new_id, = new_ids
         #print self.post_llik
+        print 'STARTING: suggest1', len(trials)
 
         bandit = self.bandit
         docs_by_tid = dict([(d['tid'], d) for d in trials.trials])
@@ -664,18 +701,7 @@ class TreeParzenEstimator(BanditAlgo):
             # N.B. THIS SEEDS THE RNG BASED ON THE new_ids
             return BanditAlgo.suggest(self, new_ids, trials)
 
-        LF = 100
-        if self.linear_forgetting and len(docs) > LF:
-            
-            pkeepdoc = (1.0 - np.arange(len(docs), dtype='float') / len(docs))[::-1]
-            if 1:
-                pkeepdoc *= len(docs) / float(len(docs) - LF)
-                assert np.all(pkeepdoc[-LF:] >= 1.0)
-            keepdoc = self.rng.rand(len(docs)) < pkeepdoc
-            #print pkeepdoc
-            #print keepdoc
-            assert len(keepdoc) == len(docs)
-            docs = [d for k, d in zip(keepdoc, docs) if k]
+        docs = self.forget_filter(docs)
 
         tids = [d['tid'] for d in docs]
 
@@ -702,6 +728,83 @@ class TreeParzenEstimator(BanditAlgo):
         memo[self.observed_loss['vals']] = \
                 [bandit.loss(d['result'], d['spec']) for d in docs]
 
+
+        if 1:
+            if self.n_EI_candidates > 1:
+                raise NotImplementedError()
+
+            # draw a sample from the posterior below gamma to start things off
+            i_idxs_vals = pyll.rec_eval(
+                    (self.post_below['idxs'], self.post_below['vals']),
+                    memo=memo)
+
+            if 0:
+
+
+                # -- figure out which variables we're going to optimize, and
+                #    how they should be bounded.
+                nids_to_optimize = []
+                lbounds = []
+                ubounds = []
+                for k in i_idxs_vals[0]:
+                    dist = self.vh.name_by_id[k]
+                    if 'uniform' == dist:
+                        nids_to_optimize.append(k)
+                        lbounds.append(np.exp())
+                        ubounds.append(np.exp())
+                    if 'loguniform' == dist:
+                        nids_to_optimize.append(k)
+                        lbounds.append(np.exp())
+                        ubounds.append(np.exp())
+                    if 'normal' in dist:
+                        nids_to_optimize.append(k)
+                        lbounds.append(None)
+                        ubounds.append(None)
+
+            # -- flatten the sampled vals
+            all_vals = []
+            for k, v in i_idxs_vals[1].items():
+                all_vals.extend(v)
+
+            def foo(pt):
+                t0 = time.time()
+                if np.min(pt) <= 0 or np.max(pt) > 1:
+                    return float('inf')
+
+                opt_memo = {}
+                for k in memo:
+                    # CONSIDER SHALLOW COPY FOR SPEED
+                    #opt_memo[k] = copy.deepcopy(memo[k])
+                    opt_memo[k] = memo[k]
+                #print pt
+                ii = 0
+                for k, v in self.post_below['vals'].items():
+                    assert v in opt_memo
+                    nv = len(i_idxs_vals[1][k])
+                    new_vals = np.array(pt[ii:ii+nv])
+                    opt_memo[v] = new_vals
+                    ii += nv
+                aa, bb = pyll.rec_eval(
+                    [self.post_above['llik'], self.post_below['llik']],
+                    memo=opt_memo)
+                rval = -(bb - aa).max()
+                #print rval
+                #print time.time() - t0
+                return rval
+            found = scipy.optimize.fmin_powell(foo, all_vals, maxfun=1000)
+
+            print found
+
+            # copy the result of the optimization back into the memo used
+            # to construct specs
+            ii = 0
+            for k, v in self.post_below['vals'].items():
+                assert v in memo # -- because of drawing i_idxs_vals
+                nv = len(i_idxs_vals[1][k])
+                new_vals = np.array(found[ii:ii+nv])
+                memo[v] = new_vals
+                ii += nv
+
         R = pyll.rec_eval(
                 dict(
                     specs=self.post_below['specs'],
@@ -718,6 +821,9 @@ class TreeParzenEstimator(BanditAlgo):
         # -- retrieve the best of the samples and form the return tuple
         llik_diff = R['below_llik'] - R['above_llik']
         winning_pos = np.argmax(llik_diff)
+
+        print 'actually chose pt with EI', llik_diff[winning_pos]
+
         winning_fake_id = winning_pos + fake_ids[0]
 
         rval_specs = [R['specs'][winning_pos]]
