@@ -795,12 +795,12 @@ class TreeParzenEstimator(BanditAlgo):
 
         assert len(found) == len(lbounds) == len(qlevels)
         if any(pti < lbi for pti, lbi in zip(found, lbounds) if lbi is not None):
-            for pti, lbi in zip(all_vals, lbounds):
+            for pti, lbi in zip(found, lbounds):
                 print pti,'<',  lbi, ':', pti < lbi
             print >> sys.stderr, "Optimizer ignored the lower bounds"
             return memo
         if any(pti > ubi for pti, ubi in zip(found, ubounds) if ubi is not None):
-            for pti, ubi in zip(all_vals, ubounds):
+            for pti, ubi in zip(found, ubounds):
                 print pti,'>',  ubi, ':', pti > ubi
             print >> sys.stderr, "Optimizer ignored the upper bounds"
             return memo
