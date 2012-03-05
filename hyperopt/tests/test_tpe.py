@@ -720,3 +720,29 @@ def test_opt_qn_normal(f=scope.normal):
         plt.hist(np.asarray(end).flatten())
         plt.show()
 
+
+def test_opt_what_happened():
+
+    vals = [3, 9, 3, 9,
+            1, 1, 1, 1,
+            1, 1, 1, 1,
+            #1, 10, 10, 10,
+            #10, 10,
+            ]
+    idxs = range(len(vals))
+    losses = [.4, .45, .35, .41,
+            .5, .43, .44, .48,
+            .46, .48, .45, .48,]
+
+    from hyperopt.tpe import ap_filter_trials
+    ap_filter_trials
+
+    import matplotlib.pyplot as plt
+    plt.subplot(2, 1, 1)
+    plt.scatter(range(len(Ys)), Xs)
+    plt.subplot(2, 1, 2)
+    plt.scatter(range(len(Xs)), Ys)
+    plt.show()
+
+
+
